@@ -2,6 +2,7 @@
 //!
 //! Polls IMAP for new emails and sends responses via SMTP using `lettre`.
 //! Uses the subject line for agent routing (e.g., "\[coder\] Fix this bug").
+//! Supports both basic authentication and OAuth2 for Office 365 and other modern email providers.
 
 use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser};
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::Stream;
 use lettre::message::Mailbox;
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::AsyncSmtpTransport;
 use lettre::AsyncTransport;
 use lettre::Tokio1Executor;
@@ -35,6 +36,49 @@ impl imap::Authenticator for PlainAuthenticator {
     }
 }
 
+/// OAuth2 XOAUTH2 authenticator for IMAP servers (Gmail, Office 365, etc.)
+/// Format: user=<email>\x01auth=Bearer <access_token>\x01\x01
+struct XOAuth2Authenticator {
+    email: String,
+    access_token: String,
+}
+
+impl imap::Authenticator for XOAuth2Authenticator {
+    type Response = String;
+    fn process(&self, _data: &[u8]) -> Self::Response {
+        format!("user={}\x01auth=Bearer {}\x01\x01", self.email, self.access_token)
+    }
+}
+
+/// Authentication method for email adapter.
+#[derive(Debug, Clone)]
+pub enum EmailAuthMethod {
+    /// Basic authentication with username and password.
+    Basic {
+        username: String,
+        password: Zeroizing<String>,
+    },
+    /// OAuth2 authentication using access token.
+    OAuth2 {
+        email: String,
+        access_token: Zeroizing<String>,
+        refresh_token: Option<Zeroizing<String>>,
+        token_endpoint: String,
+        client_id: String,
+        client_secret: Zeroizing<String>,
+    },
+}
+
+impl EmailAuthMethod {
+    /// Get the email address from the auth method.
+    fn email(&self) -> &str {
+        match self {
+            EmailAuthMethod::Basic { username, .. } => username,
+            EmailAuthMethod::OAuth2 { email, .. } => email,
+        }
+    }
+}
+
 /// Reply context for email threading (In-Reply-To / Subject continuity).
 #[derive(Debug, Clone)]
 struct ReplyCtx {
@@ -52,10 +96,8 @@ pub struct EmailAdapter {
     smtp_host: String,
     /// SMTP port (587 for STARTTLS, 465 for implicit TLS).
     smtp_port: u16,
-    /// Email address (used for both IMAP and SMTP).
-    username: String,
-    /// SECURITY: Password is zeroized on drop.
-    password: Zeroizing<String>,
+    /// Authentication method.
+    auth_method: EmailAuthMethod,
     /// How often to check for new emails.
     poll_interval: Duration,
     /// Which IMAP folders to monitor.
@@ -67,10 +109,12 @@ pub struct EmailAdapter {
     shutdown_rx: watch::Receiver<bool>,
     /// Tracks reply context per sender for email threading.
     reply_ctx: Arc<DashMap<String, ReplyCtx>>,
+    /// HTTP client for OAuth2 token refresh.
+    http_client: reqwest::Client,
 }
 
 impl EmailAdapter {
-    /// Create a new email adapter.
+    /// Create a new email adapter with basic authentication.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         imap_host: String,
@@ -89,8 +133,10 @@ impl EmailAdapter {
             imap_port,
             smtp_host,
             smtp_port,
-            username,
-            password: Zeroizing::new(password),
+            auth_method: EmailAuthMethod::Basic {
+                username,
+                password: Zeroizing::new(password),
+            },
             poll_interval: Duration::from_secs(poll_interval_secs),
             folders: if folders.is_empty() {
                 vec!["INBOX".to_string()]
@@ -101,6 +147,52 @@ impl EmailAdapter {
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             reply_ctx: Arc::new(DashMap::new()),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    /// Create a new email adapter with OAuth2 authentication (for Office 365, Gmail, etc.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_oauth2(
+        imap_host: String,
+        imap_port: u16,
+        smtp_host: String,
+        smtp_port: u16,
+        email: String,
+        access_token: String,
+        refresh_token: Option<String>,
+        token_endpoint: String,
+        client_id: String,
+        client_secret: String,
+        poll_interval_secs: u64,
+        folders: Vec<String>,
+        allowed_senders: Vec<String>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self {
+            imap_host,
+            imap_port,
+            smtp_host,
+            smtp_port,
+            auth_method: EmailAuthMethod::OAuth2 {
+                email,
+                access_token: Zeroizing::new(access_token),
+                refresh_token: refresh_token.map(Zeroizing::new),
+                token_endpoint,
+                client_id,
+                client_secret: Zeroizing::new(client_secret),
+            },
+            poll_interval: Duration::from_secs(poll_interval_secs),
+            folders: if folders.is_empty() {
+                vec!["INBOX".to_string()]
+            } else {
+                folders
+            },
+            allowed_senders,
+            shutdown_tx: Arc::new(shutdown_tx),
+            shutdown_rx,
+            reply_ctx: Arc::new(DashMap::new()),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -135,24 +227,110 @@ impl EmailAdapter {
         subject.to_string()
     }
 
+    /// Refresh OAuth2 access token if needed.
+    async fn refresh_oauth2_token(&self) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+        let auth = match &self.auth_method {
+            EmailAuthMethod::OAuth2 {
+                refresh_token,
+                token_endpoint,
+                client_id,
+                client_secret,
+                ..
+            } => (refresh_token, token_endpoint, client_id, client_secret),
+            _ => return Err("Not using OAuth2 authentication".into()),
+        };
+
+        let refresh_token = match auth.0 {
+            Some(ref rt) => rt.as_str(),
+            None => return Err("No refresh token available".into()),
+        };
+
+        let params = [
+            ("client_id", auth.2.as_str()),
+            ("client_secret", auth.3.as_str()),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ];
+
+        let response = self
+            .http_client
+            .post(auth.1.as_str())
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("OAuth2 token refresh request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!("OAuth2 token refresh failed: {}", response.status()).into());
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            #[serde(default)]
+            expires_in: Option<u64>,
+        }
+
+        let token_data: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse OAuth2 response: {e}"))?;
+
+        info!(
+            expires_in = token_data.expires_in,
+            "OAuth2 token refreshed successfully"
+        );
+
+        Ok(Zeroizing::new(token_data.access_token))
+    }
+
     /// Build an async SMTP transport for sending emails.
     async fn build_smtp_transport(
         &self,
     ) -> Result<AsyncSmtpTransport<Tokio1Executor>, Box<dyn std::error::Error>> {
-        let creds = Credentials::new(self.username.clone(), self.password.as_str().to_string());
+        let transport = match &self.auth_method {
+            EmailAuthMethod::Basic { username, password } => {
+                let creds = Credentials::new(username.clone(), password.as_str().to_string());
 
-        let transport = if self.smtp_port == 465 {
-            // Implicit TLS (port 465)
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&self.smtp_host)?
-                .port(self.smtp_port)
-                .credentials(creds)
-                .build()
-        } else {
-            // STARTTLS (port 587 or other)
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.smtp_host)?
-                .port(self.smtp_port)
-                .credentials(creds)
-                .build()
+                if self.smtp_port == 465 {
+                    // Implicit TLS (port 465)
+                    AsyncSmtpTransport::<Tokio1Executor>::relay(&self.smtp_host)?
+                        .port(self.smtp_port)
+                        .credentials(creds)
+                        .build()
+                } else {
+                    // STARTTLS (port 587 or other)
+                    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.smtp_host)?
+                        .port(self.smtp_port)
+                        .credentials(creds)
+                        .build()
+                }
+            }
+            EmailAuthMethod::OAuth2 { email, .. } => {
+                let access_token = match &self.auth_method {
+                    EmailAuthMethod::OAuth2 { access_token, .. } => access_token.clone(),
+                    _ => unreachable!(),
+                };
+
+                // For SMTP with OAuth2, use XOAUTH2 mechanism
+                // Format: user=<email>\x01auth=Bearer <token>\x01\x01
+                let auth_string = format!("user={}\x01auth=Bearer {}\x01\x01", email, access_token.as_str());
+                let creds = Credentials::new(email.clone(), auth_string);
+
+                if self.smtp_port == 465 {
+                    AsyncSmtpTransport::<Tokio1Executor>::relay(&self.smtp_host)?
+                        .port(self.smtp_port)
+                        .credentials(creds)
+                        .mechanism(Mechanism::Xoauth2)
+                        .build()
+                } else {
+                    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.smtp_host)?
+                        .port(self.smtp_port)
+                        .credentials(creds)
+                        .mechanism(Mechanism::Xoauth2)
+                        .build()
+                }
+            }
         };
 
         Ok(transport)
@@ -206,9 +384,10 @@ fn extract_text_body(parsed: &mailparse::ParsedMail<'_>) -> String {
 fn fetch_unseen_emails(
     host: &str,
     port: u16,
-    username: &str,
-    password: &str,
+    email: &str,
+    password_or_token: &str,
     folders: &[String],
+    use_oauth2: bool,
 ) -> Result<Vec<(String, String, String, String)>, String> {
     let tls = native_tls::TlsConnector::builder()
         .build()
@@ -217,20 +396,31 @@ fn fetch_unseen_emails(
     let client =
         imap::connect((host, port), host, &tls).map_err(|e| format!("IMAP connect failed: {e}"))?;
 
-    // Try LOGIN first; fall back to AUTHENTICATE PLAIN for servers like Lark
-    // that reject LOGIN and only support AUTH=PLAIN (SASL).
-    let mut session = match client.login(username, password) {
-        Ok(s) => s,
-        Err((login_err, client)) => {
-            let authenticator = PlainAuthenticator {
-                username: username.to_string(),
-                password: password.to_string(),
-            };
-            client
-                .authenticate("PLAIN", &authenticator)
-                .map_err(|(e, _)| {
-                    format!("IMAP login failed: {login_err}; AUTH=PLAIN also failed: {e}")
-                })?
+    // Authenticate based on method
+    let mut session = if use_oauth2 {
+        // OAuth2 XOAUTH2 authentication
+        let authenticator = XOAuth2Authenticator {
+            email: email.to_string(),
+            access_token: password_or_token.to_string(),
+        };
+        client
+            .authenticate("XOAUTH2", &authenticator)
+            .map_err(|(e, _)| format!("IMAP XOAUTH2 authentication failed: {e}"))?
+    } else {
+        // Try LOGIN first; fall back to AUTHENTICATE PLAIN for servers like Lark
+        match client.login(email, password_or_token) {
+            Ok(s) => s,
+            Err((login_err, client)) => {
+                let authenticator = PlainAuthenticator {
+                    username: email.to_string(),
+                    password: password_or_token.to_string(),
+                };
+                client
+                    .authenticate("PLAIN", &authenticator)
+                    .map_err(|(e, _)| {
+                        format!("IMAP login failed: {login_err}; AUTH=PLAIN also failed: {e}")
+                    })?
+            }
         }
     };
 
@@ -322,16 +512,25 @@ impl ChannelAdapter for EmailAdapter {
         let poll_interval = self.poll_interval;
         let imap_host = self.imap_host.clone();
         let imap_port = self.imap_port;
-        let username = self.username.clone();
-        let password = self.password.clone();
+        let email = self.auth_method.email().to_string();
+        let password_or_token = match &self.auth_method {
+            EmailAuthMethod::Basic { password, .. } => password.clone(),
+            EmailAuthMethod::OAuth2 { access_token, .. } => access_token.clone(),
+        };
+        let use_oauth2 = matches!(self.auth_method, EmailAuthMethod::OAuth2 { .. });
         let folders = self.folders.clone();
         let allowed_senders = self.allowed_senders.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let reply_ctx = self.reply_ctx.clone();
 
         info!(
-            "Starting email adapter (IMAP: {}:{}, SMTP: {}:{}, polling every {:?})",
-            imap_host, imap_port, self.smtp_host, self.smtp_port, poll_interval
+            "Starting email adapter (IMAP: {}:{}, SMTP: {}:{}, auth_method={}, polling every {:?})",
+            imap_host,
+            imap_port,
+            self.smtp_host,
+            self.smtp_port,
+            if use_oauth2 { "OAuth2" } else { "Basic" },
+            poll_interval
         );
 
         tokio::spawn(async move {
@@ -347,12 +546,12 @@ impl ChannelAdapter for EmailAdapter {
                 // IMAP operations are blocking I/O — run in spawn_blocking
                 let host = imap_host.clone();
                 let port = imap_port;
-                let user = username.clone();
-                let pass = password.clone();
+                let em = email.clone();
+                let pass = password_or_token.clone();
                 let fldrs = folders.clone();
 
                 let emails = tokio::task::spawn_blocking(move || {
-                    fetch_unseen_emails(&host, port, &user, pass.as_str(), &fldrs)
+                    fetch_unseen_emails(&host, port, &em, pass.as_str(), &fldrs, use_oauth2)
                 })
                 .await;
 
@@ -440,9 +639,10 @@ impl ChannelAdapter for EmailAdapter {
                     .map_err(|e| format!("Invalid recipient email '{}': {}", to_addr, e))?;
 
                 let from_mailbox: Mailbox = self
-                    .username
+                    .auth_method
+                    .email()
                     .parse()
-                    .map_err(|e| format!("Invalid sender email '{}': {}", self.username, e))?;
+                    .map_err(|e| format!("Invalid sender email '{}': {}", self.auth_method.email(), e))?;
 
                 // Extract subject from text body convention: "Subject: ...\n\n..."
                 let (subject, body) = if text.starts_with("Subject: ") {
@@ -528,6 +728,28 @@ mod tests {
         );
         assert_eq!(adapter.name(), "email");
         assert_eq!(adapter.folders, vec!["INBOX".to_string()]);
+    }
+
+    #[test]
+    fn test_email_adapter_oauth2_creation() {
+        let adapter = EmailAdapter::with_oauth2(
+            "imap.outlook.office365.com".to_string(),
+            993,
+            "smtp.office365.com".to_string(),
+            587,
+            "user@company.onmicrosoft.com".to_string(),
+            "access_token_xyz".to_string(),
+            Some("refresh_token_abc".to_string()),
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
+            "client_id_123".to_string(),
+            "client_secret_456".to_string(),
+            30,
+            vec![],
+            vec![],
+        );
+        assert_eq!(adapter.name(), "email");
+        assert_eq!(adapter.folders, vec!["INBOX".to_string()]);
+        assert!(matches!(adapter.auth_method, EmailAuthMethod::OAuth2 { .. }));
     }
 
     #[test]
